@@ -1,0 +1,102 @@
+name: VPS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core SSH Settings
+        run: |
+          # Enable password authentication
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Allow SSH connections
+          sudo ufw allow 22/tcp
+          
+          # Restart SSH service to apply changes
+          sudo systemctl restart ssh
+
+      - name: Create VPS User with Secure Password
+        run: |
+          # Generate secure random password
+          UPPER=$(tr -dc 'A-Z' < /dev/urandom | head -c 4)
+          LOWER=$(tr -dc 'a-z' < /dev/urandom | head -c 4)
+          NUMBER=$(tr -dc '0-9' < /dev/urandom | head -c 4)
+          SPECIAL=$(tr -dc '!@#$%^&*()_+-=' < /dev/urandom | head -c 4)
+          PASSWORD=$(echo "${UPPER}${LOWER}${NUMBER}${SPECIAL}" | fold -w1 | shuf | tr -d '\n')
+          
+          # Create user
+          sudo useradd -m -s /bin/bash -G sudo VPS
+          echo "VPS:$PASSWORD" | sudo chpasswd
+          
+          # Allow sudo without password
+          echo "VPS ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/VPS
+          sudo chmod 0440 /etc/sudoers.d/VPS
+          
+          echo "VPS_CREDS=User: VPS | Password: $PASSWORD" >> $GITHUB_ENV
+          
+          # Verify user was created
+          if ! id "VPS" &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh -o /tmp/tailscale-install.sh
+          
+          sudo sh /tmp/tailscale-install.sh
+          sudo rm /tmp/tailscale-install.sh
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          tsIP=""
+          retries=0
+          while [ -z "$tsIP" ] && [ $retries -lt 10 ]; do
+              tsIP=$(tailscale ip -4 2>/dev/null)
+              sleep 5
+              retries=$((retries + 1))
+          done
+          
+          if [ -z "$tsIP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+      
+      - name: Verify SSH Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          
+          # Test connectivity using netstat to check if SSH is listening on port 22
+          if sudo netstat -tulpn | grep -q ':22.*LISTEN'; then
+              echo "TCP connectivity successful!"
+          else
+              echo "TCP connection to SSH port 22 failed"
+              exit 1
+          fi
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== VPS ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: VPS"
+          echo "Password: $(echo $VPS_CREDS | cut -d'|' -f2 | xargs)"
+          echo "=================="
+          echo ""
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while true; do
+              echo "[$(date)] VPS Active - Use Ctrl+C in workflow to terminate"
+              sleep 300
+          done
