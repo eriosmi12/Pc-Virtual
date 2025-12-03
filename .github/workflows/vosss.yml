@@ -212,18 +212,21 @@ Senha: $env:RDP_PASSWORD
       - name: Keep Alive Monitor
         run: |
           $startTime = Get-Date
-          $maxRuntime = New-TimeSpan -Minutes 345  # 5h45min
+          $maxRuntime = New-TimeSpan -Minutes 345
           
           Write-Host "Monitoramento ativo iniciado..."
-          Write-Host "Tempo máximo de execução: 5h45min"
+          Write-Host "Tempo maximo de execucao: 5h45min"
           
           while ((Get-Date) - $startTime -lt $maxRuntime) {
               $elapsed = (Get-Date) - $startTime
               $remaining = $maxRuntime - $elapsed
               
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP ATIVO | Tempo decorrido: $($elapsed.ToString('hh\:mm\:ss')) | Restante: $($remaining.ToString('hh\:mm\:ss'))"
+              $elapsedStr = $elapsed.ToString('hh\:mm\:ss')
+              $remainingStr = $remaining.ToString('hh\:mm\:ss')
+              $currentTime = Get-Date -Format 'HH:mm:ss'
               
-              # Verificar se Tailscale ainda está conectado
+              Write-Host "[$currentTime] RDP ATIVO | Tempo decorrido: $elapsedStr | Restante: $remainingStr"
+              
               $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
               if ($tsStatus.BackendState -ne "Running") {
                   Write-Warning "Reconectando Tailscale..."
@@ -233,7 +236,7 @@ Senha: $env:RDP_PASSWORD
               Start-Sleep -Seconds 60
           }
           
-          Write-Host "Tempo limite alcançado. Encerrando graciosamente..."
+          Write-Host "Tempo limite alcancado. Encerrando graciosamente..."
 
       - name: Save State Before Exit
         if: always()
