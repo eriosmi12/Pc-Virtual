@@ -3,7 +3,6 @@ name: RDP 24/7 Enhanced
 on:
   workflow_dispatch:
   schedule:
-    # Executa a cada 5 horas e 30 minutos para manter 24/7
     - cron: '30 */5 * * *'
   push:
     branches: [ main ]
@@ -11,7 +10,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 350  # 5h50min (deixa margem antes do próximo cron)
+    timeout-minutes: 350
 
     steps:
       - name: Checkout Repository
@@ -30,33 +29,18 @@ jobs:
       
       - name: Configure Enhanced RDP Settings
         run: |
-          # Habilitar RDP com configurações otimizadas
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-          
-          # Otimizações de performance
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "KeepAliveTimeout" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "KeepAliveInterval" -Value 1 -Force
-
-          # Limpar regras antigas
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveTimeout" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveInterval" -Value 1 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          
-          # Adicionar regra de firewall
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389 profile=any
-
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 profile=any
           Restart-Service -Name TermService -Force
           Write-Host "RDP configurado com sucesso!"
 
       - name: Create RDP User with Strong Password
         run: |
-          # Gerar senha forte de 20 caracteres
           Add-Type -AssemblyName System.Security
           $charSet = @{
               Upper   = [char[]](65..90)
@@ -70,51 +54,33 @@ jobs:
           $rawPassword += $charSet.Number | Get-Random -Count 5
           $rawPassword += $charSet.Special | Get-Random -Count 5
           $password = -join ($rawPassword | Sort-Object { Get-Random })
-          
-          # Remover usuário se já existir
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
               Remove-LocalUser -Name "RDP" -Force
           }
-          
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires `
-                        -PasswordNeverExpires $true -UserMayNotChangePassword $false
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires $true -UserMayNotChangePassword $false
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          
-          # Salvar credenciais
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          
-          Write-Host "Usuário RDP criado com sucesso!"
+          Write-Host "Usuario RDP criado com sucesso!"
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Write-Host "Baixando Tailscale..."
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          
           Write-Host "Instalando Tailscale..."
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
-          
           Write-Host "Tailscale instalado!"
 
       - name: Connect to Tailscale Network
         run: |
           $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          
-          # Hostname único baseado no timestamp
           $hostname = "gh-rdp-$(Get-Date -Format 'MMdd-HHmm')"
-          
           Write-Host "Conectando ao Tailscale..."
-          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-                               --hostname=$hostname `
-                               --accept-routes `
-                               --advertise-exit-node=false
-          
-          # Aguardar IP do Tailscale
+          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --accept-routes --advertise-exit-node=false
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 20) {
@@ -122,12 +88,10 @@ jobs:
               $tsIP = & $tailscalePath ip -4 2>$null
               $retries++
           }
-          
           if (-not $tsIP) {
               Write-Error "Falha ao obter IP do Tailscale"
               exit 1
           }
-          
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale conectado! IP: $tsIP"
 
@@ -135,128 +99,108 @@ jobs:
         run: |
           $stateDir = "C:\ProgramData\RDP-State"
           $appsDir = "C:\Users\runneradmin\AppData\Local\RDP-Apps"
-          
           if (Test-Path $stateDir) {
               Write-Host "Restaurando estado anterior..."
-              # Restaurar configurações, programas instalados, etc.
               Get-ChildItem $stateDir -Recurse | ForEach-Object {
                   Write-Host "Arquivo restaurado: $($_.Name)"
               }
           } else {
-              Write-Host "Primeira execução - criando diretórios de estado..."
+              Write-Host "Primeira execucao - criando diretorios de estado..."
               New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
               New-Item -ItemType Directory -Path $appsDir -Force | Out-Null
           }
 
       - name: Install Common Applications
         run: |
-          Write-Host "Instalando aplicações essenciais..."
-          
-          # Instalar Chocolatey se não existir
+          Write-Host "Instalando aplicacoes essenciais..."
           if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
               Set-ExecutionPolicy Bypass -Scope Process -Force
               [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
               Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
           }
-          
-          # Lista de aplicações populares (comente as que não precisar)
-          $apps = @(
-              'googlechrome',
-              '7zip',
-              'notepadplusplus',
-              'git',
-              'vscode'
-          )
-          
+          $apps = @('googlechrome','7zip','notepadplusplus','git','vscode')
           foreach ($app in $apps) {
               Write-Host "Instalando $app..."
               choco install $app -y --no-progress --limit-output
           }
-          
-          Write-Host "Aplicações instaladas com sucesso!"
+          Write-Host "Aplicacoes instaladas com sucesso!"
 
       - name: Verify RDP Connection
         run: |
           Write-Host "Verificando conectividade RDP..."
-          
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          
           if ($testResult.TcpTestSucceeded) {
-              Write-Host "✓ RDP está acessível na porta 3389"
+              Write-Host "RDP acessivel na porta 3389"
           } else {
-              Write-Error "✗ Falha na conectividade RDP"
+              Write-Error "Falha na conectividade RDP"
               exit 1
           }
 
       - name: Display Connection Info
         run: |
-          Write-Host "`n╔════════════════════════════════════════╗"
-          Write-Host "║     INFORMAÇÕES DE ACESSO RDP         ║"
-          Write-Host "╠════════════════════════════════════════╣"
-          Write-Host "║ IP Tailscale: $env:TAILSCALE_IP"
-          Write-Host "║ Usuário:      RDP"
-          Write-Host "║ Senha:        $env:RDP_PASSWORD"
-          Write-Host "╠════════════════════════════════════════╣"
-          Write-Host "║ Status: ONLINE ✓                      ║"
-          Write-Host "║ Tempo ativo: ~5h50min                 ║"
-          Write-Host "╚════════════════════════════════════════╝`n"
-          
-          # Salvar info em arquivo para referência
-          @"
-Última conexão: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "     INFORMACOES DE ACESSO RDP"
+          Write-Host "========================================"
+          Write-Host "IP Tailscale: $env:TAILSCALE_IP"
+          Write-Host "Usuario:      RDP"
+          Write-Host "Senha:        $env:RDP_PASSWORD"
+          Write-Host "========================================"
+          Write-Host "Status: ONLINE"
+          Write-Host "Tempo ativo: ~5h50min"
+          Write-Host "========================================"
+          Write-Host ""
+          $connectionInfo = @"
+Ultima conexao: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 IP: $env:TAILSCALE_IP
-Usuário: RDP
+Usuario: RDP
 Senha: $env:RDP_PASSWORD
-"@ | Out-File -FilePath "C:\ProgramData\RDP-State\connection-info.txt" -Force
+"@
+          $connectionInfo | Out-File -FilePath "C:\ProgramData\RDP-State\connection-info.txt" -Force
 
       - name: Keep Alive Monitor
         run: |
           $startTime = Get-Date
-          $maxRuntime = New-TimeSpan -Minutes 345
-          
+          $maxMinutes = 345
+          $maxRuntime = New-TimeSpan -Minutes $maxMinutes
           Write-Host "Monitoramento ativo iniciado..."
           Write-Host "Tempo maximo de execucao: 5h45min"
-          
           while ((Get-Date) - $startTime -lt $maxRuntime) {
               $elapsed = (Get-Date) - $startTime
               $remaining = $maxRuntime - $elapsed
-              
-              $elapsedStr = $elapsed.ToString('hh\:mm\:ss')
-              $remainingStr = $remaining.ToString('hh\:mm\:ss')
               $currentTime = Get-Date -Format 'HH:mm:ss'
-              
-              Write-Host "[$currentTime] RDP ATIVO | Tempo decorrido: $elapsedStr | Restante: $remainingStr"
-              
-              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
-              if ($tsStatus.BackendState -ne "Running") {
-                  Write-Warning "Reconectando Tailscale..."
-                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+              $elapsedFormatted = "{0:D2}:{1:D2}:{2:D2}" -f $elapsed.Hours, $elapsed.Minutes, $elapsed.Seconds
+              $remainingFormatted = "{0:D2}:{1:D2}:{2:D2}" -f $remaining.Hours, $remaining.Minutes, $remaining.Seconds
+              Write-Host "[$currentTime] RDP ATIVO | Decorrido: $elapsedFormatted | Restante: $remainingFormatted"
+              try {
+                  $tsStatusJson = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null
+                  if ($tsStatusJson) {
+                      $tsStatus = $tsStatusJson | ConvertFrom-Json
+                      if ($tsStatus.BackendState -ne "Running") {
+                          Write-Warning "Reconectando Tailscale..."
+                          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+                      }
+                  }
+              } catch {
+                  Write-Host "Aviso: Nao foi possivel verificar status do Tailscale"
               }
-              
               Start-Sleep -Seconds 60
           }
-          
           Write-Host "Tempo limite alcancado. Encerrando graciosamente..."
 
       - name: Save State Before Exit
         if: always()
         run: |
           Write-Host "Salvando estado atual..."
-          
           $stateDir = "C:\ProgramData\RDP-State"
           $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-          
-          # Salvar lista de programas instalados
-          Get-WmiObject -Class Win32_Product | Select-Object Name, Version | 
-              Export-Csv "$stateDir\installed-programs-$timestamp.csv" -NoTypeInformation
-          
-          # Salvar configurações do sistema
-          @{
+          Get-WmiObject -Class Win32_Product | Select-Object Name, Version | Export-Csv "$stateDir\installed-programs-$timestamp.csv" -NoTypeInformation
+          $stateData = @{
               LastRun = $timestamp
               TailscaleIP = $env:TAILSCALE_IP
               RunID = "${{ github.run_id }}"
-          } | ConvertTo-Json | Out-File "$stateDir\last-run.json" -Force
-          
+          }
+          $stateData | ConvertTo-Json | Out-File "$stateDir\last-run.json" -Force
           Write-Host "Estado salvo com sucesso!"
 
       - name: Cache State for Next Run
