@@ -42,23 +42,21 @@ jobs:
       - name: Create RDP User with Strong Password
         run: |
           Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = @('!','@','#','$','%','^','&','*','(',')','_','+','-','=')
-          }
+          $upper = [char[]](65..90)
+          $lower = [char[]](97..122)
+          $number = [char[]](48..57)
+          $special = @('!','@','#','$','%','^','&','*','_','+','-','=')
           $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 5
-          $rawPassword += $charSet.Lower | Get-Random -Count 5
-          $rawPassword += $charSet.Number | Get-Random -Count 5
-          $rawPassword += $charSet.Special | Get-Random -Count 5
+          $rawPassword += $upper | Get-Random -Count 5
+          $rawPassword += $lower | Get-Random -Count 5
+          $rawPassword += $number | Get-Random -Count 5
+          $rawPassword += $special | Get-Random -Count 5
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
               Remove-LocalUser -Name "RDP" -Force
           }
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires $true -UserMayNotChangePassword $false
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
@@ -189,8 +187,15 @@ jobs:
         run: |
           Write-Host "Salvando estado atual..."
           $stateDir = "C:\ProgramData\RDP-State"
+          if (-not (Test-Path $stateDir)) {
+              New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+          }
           $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-          Get-WmiObject -Class Win32_Product | Select-Object Name, Version | Export-Csv "$stateDir\installed-programs-$timestamp.csv" -NoTypeInformation
+          try {
+              Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName, DisplayVersion | Export-Csv "$stateDir\installed-programs-$timestamp.csv" -NoTypeInformation -ErrorAction SilentlyContinue
+          } catch {
+              Write-Host "Aviso: Nao foi possivel listar programas instalados"
+          }
           $stateData = @{
               LastRun = $timestamp
               TailscaleIP = $env:TAILSCALE_IP
