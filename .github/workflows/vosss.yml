@@ -150,12 +150,8 @@ jobs:
           Write-Host "Tempo ativo: ~5h50min"
           Write-Host "========================================"
           Write-Host ""
-          $connectionInfo = @"
-Ultima conexao: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-IP: $env:TAILSCALE_IP
-Usuario: RDP
-Senha: $env:RDP_PASSWORD
-"@
+          $currentDateTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+          $connectionInfo = "Ultima conexao: $currentDateTime`nIP: $env:TAILSCALE_IP`nUsuario: RDP`nSenha: $env:RDP_PASSWORD"
           $connectionInfo | Out-File -FilePath "C:\ProgramData\RDP-State\connection-info.txt" -Force
 
       - name: Keep Alive Monitor
