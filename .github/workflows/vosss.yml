@@ -1,214 +1,417 @@
-name: RDP 24/7 Enhanced
+name: RDP
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '30 */5 * * *'
-  push:
-    branches: [ main ]
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Restore State from Cache
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            C:\ProgramData\RDP-State
-            C:\Users\runneradmin\AppData\Local\RDP-Apps
-          key: rdp-state-${{ github.run_id }}
-          restore-keys: |
-            rdp-state-
-      
-      - name: Configure Enhanced RDP Settings
+      - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveTimeout" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveInterval" -Value 1 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 profile=any
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP configurado com sucesso!"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Create RDP User with Strong Password
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
-          $upper = [char[]](65..90)
-          $lower = [char[]](97..122)
-          $number = [char[]](48..57)
-          $special = @('!','@','#','$','%','^','&','*','_','+','-','=')
-          $rawPassword = @()
-          $rawPassword += $upper | Get-Random -Count 5
-          $rawPassword += $lower | Get-Random -Count 5
-          $rawPassword += $number | Get-Random -Count 5
-          $rawPassword += $special | Get-Random -Count 5
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name "RDP" -Force
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
           }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "Usuario RDP criado com sucesso!"
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          Write-Host "Baixando Tailscale..."
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          Write-Host "Instalando Tailscale..."
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
-          Write-Host "Tailscale instalado!"
 
-      - name: Connect to Tailscale Network
+      - name: Establish Tailscale Connection
         run: |
-          $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $hostname = "gh-rdp-$(Get-Date -Format 'MMdd-HHmm')"
-          Write-Host "Conectando ao Tailscale..."
-          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --accept-routes --advertise-exit-node=false
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {
-              Start-Sleep -Seconds 3
-              $tsIP = & $tailscalePath ip -4 2>$null
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
               $retries++
           }
+          
           if (-not $tsIP) {
-              Write-Error "Falha ao obter IP do Tailscale"
+              Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale conectado! IP: $tsIP"
-
-      - name: Restore Previous State
+      
+      - name: Verify RDP Accessibility
         run: |
-          $stateDir = "C:\ProgramData\RDP-State"
-          $appsDir = "C:\Users\runneradmin\AppData\Local\RDP-Apps"
-          if (Test-Path $stateDir) {
-              Write-Host "Restaurando estado anterior..."
-              Get-ChildItem $stateDir -Recurse | ForEach-Object {
-                  Write-Host "Arquivo restaurado: $($_.Name)"
-              }
-          } else {
-              Write-Host "Primeira execucao - criando diretorios de estado..."
-              New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
-              New-Item -ItemType Directory -Path $appsDir -Force | Out-Null
-          }
-
-      - name: Install Common Applications
-        run: |
-          Write-Host "Instalando aplicacoes essenciais..."
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-              Set-ExecutionPolicy Bypass -Scope Process -Force
-              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-              Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          }
-          $apps = @('googlechrome','7zip','notepadplusplus','git','vscode')
-          foreach ($app in $apps) {
-              Write-Host "Instalando $app..."
-              choco install $app -y --no-progress --limit-output
-          }
-          Write-Host "Aplicacoes instaladas com sucesso!"
-
-      - name: Verify RDP Connection
-        run: |
-          Write-Host "Verificando conectividade RDP..."
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if ($testResult.TcpTestSucceeded) {
-              Write-Host "RDP acessivel na porta 3389"
-          } else {
-              Write-Error "Falha na conectividade RDP"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-      - name: Display Connection Info
+      - name: Create Backup Directory
         run: |
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "     INFORMACOES DE ACESSO RDP"
-          Write-Host "========================================"
-          Write-Host "IP Tailscale: $env:TAILSCALE_IP"
-          Write-Host "Usuario:      RDP"
-          Write-Host "Senha:        $env:RDP_PASSWORD"
-          Write-Host "========================================"
-          Write-Host "Status: ONLINE"
-          Write-Host "Tempo ativo: ~5h50min"
-          Write-Host "========================================"
-          Write-Host ""
-          $currentDateTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-          $connectionInfo = "Ultima conexao: $currentDateTime`nIP: $env:TAILSCALE_IP`nUsuario: RDP`nSenha: $env:RDP_PASSWORD"
-          $connectionInfo | Out-File -FilePath "C:\ProgramData\RDP-State\connection-info.txt" -Force
+          $backupDir = "$env:GITHUB_WORKSPACE\backup"
+          New-Item -ItemType Directory -Path $backupDir -Force
+          New-Item -ItemType Directory -Path "$backupDir\Programs" -Force
+          New-Item -ItemType Directory -Path "$backupDir\ProgramData" -Force
+          echo "BACKUP_DIR=$backupDir" >> $env:GITHUB_ENV
 
-      - name: Keep Alive Monitor
+      - name: Maintain Connection
         run: |
-          $startTime = Get-Date
-          $maxMinutes = 345
-          $maxRuntime = New-TimeSpan -Minutes $maxMinutes
-          Write-Host "Monitoramento ativo iniciado..."
-          Write-Host "Tempo maximo de execucao: 5h45min"
-          while ((Get-Date) - $startTime -lt $maxRuntime) {
-              $elapsed = (Get-Date) - $startTime
-              $remaining = $maxRuntime - $elapsed
-              $currentTime = Get-Date -Format 'HH:mm:ss'
-              $elapsedFormatted = "{0:D2}:{1:D2}:{2:D2}" -f $elapsed.Hours, $elapsed.Minutes, $elapsed.Seconds
-              $remainingFormatted = "{0:D2}:{1:D2}:{2:D2}" -f $remaining.Hours, $remaining.Minutes, $remaining.Seconds
-              Write-Host "[$currentTime] RDP ATIVO | Decorrido: $elapsedFormatted | Restante: $remainingFormatted"
-              try {
-                  $tsStatusJson = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null
-                  if ($tsStatusJson) {
-                      $tsStatus = $tsStatusJson | ConvertFrom-Json
-                      if ($tsStatus.BackendState -ne "Running") {
-                          Write-Warning "Reconectando Tailscale..."
-                          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
-                      }
-                  }
-              } catch {
-                  Write-Host "Aviso: Nao foi possivel verificar status do Tailscale"
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Export Installed Programs List
+        if: always()
+        run: |
+          Write-Host "Exporting installed programs list..."
+          $backupDir = $env:BACKUP_DIR
+          
+          # Export installed programs from registry (64-bit)
+          Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" |
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate, InstallLocation |
+            Where-Object { $_.DisplayName } |
+            Export-Csv "$backupDir\Programs\installed_programs_x64.csv" -NoTypeInformation
+          
+          # Export installed programs from registry (32-bit)
+          Get-ItemProperty "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" |
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate, InstallLocation |
+            Where-Object { $_.DisplayName } |
+            Export-Csv "$backupDir\Programs\installed_programs_x86.csv" -NoTypeInformation
+          
+          # Export user-installed programs
+          Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" |
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate, InstallLocation |
+            Where-Object { $_.DisplayName } |
+            Export-Csv "$backupDir\Programs\installed_programs_user.csv" -NoTypeInformation
+          
+          # Export Windows features
+          Get-WindowsOptionalFeature -Online |
+            Where-Object { $_.State -eq "Enabled" } |
+            Select-Object FeatureName, State |
+            Export-Csv "$backupDir\Programs\windows_features.csv" -NoTypeInformation
+          
+          Write-Host "Programs list exported!"
+
+      - name: Backup Portable Programs
+        if: always()
+        run: |
+          Write-Host "Backing up portable programs..."
+          $backupDir = $env:BACKUP_DIR
+          
+          # Lista de diretórios comuns para programas portáteis
+          $portableDirs = @(
+              "$env:USERPROFILE\PortableApps",
+              "$env:USERPROFILE\Desktop\PortableApps",
+              "C:\PortableApps",
+              "$env:GITHUB_WORKSPACE\apps",
+              "$env:GITHUB_WORKSPACE\programs"
+          )
+          
+          foreach ($dir in $portableDirs) {
+              if (Test-Path $dir) {
+                  $dirName = Split-Path $dir -Leaf
+                  Write-Host "Backing up: $dir"
+                  Copy-Item -Path $dir -Destination "$backupDir\Programs\$dirName" -Recurse -Force -ErrorAction SilentlyContinue
               }
-              Start-Sleep -Seconds 60
           }
-          Write-Host "Tempo limite alcancado. Encerrando graciosamente..."
+          
+          Write-Host "Portable programs backup completed!"
 
-      - name: Save State Before Exit
+      - name: Backup Program Data and Configurations
         if: always()
         run: |
-          Write-Host "Salvando estado atual..."
-          $stateDir = "C:\ProgramData\RDP-State"
-          if (-not (Test-Path $stateDir)) {
-              New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+          Write-Host "Backing up program data and configurations..."
+          $backupDir = $env:BACKUP_DIR
+          
+          # Backup AppData Local
+          $appDataLocal = "$env:LOCALAPPDATA"
+          if (Test-Path $appDataLocal) {
+              Write-Host "Backing up AppData Local..."
+              # Lista de pastas importantes (ajuste conforme necessário)
+              $importantApps = @("Google", "Microsoft", "Mozilla", "Discord", "Slack", "Telegram", "Programs")
+              foreach ($app in $importantApps) {
+                  $appPath = Join-Path $appDataLocal $app
+                  if (Test-Path $appPath) {
+                      Copy-Item -Path $appPath -Destination "$backupDir\ProgramData\AppData_Local\$app" -Recurse -Force -ErrorAction SilentlyContinue
+                  }
+              }
           }
-          $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-          try {
-              Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName, DisplayVersion | Export-Csv "$stateDir\installed-programs-$timestamp.csv" -NoTypeInformation -ErrorAction SilentlyContinue
-          } catch {
-              Write-Host "Aviso: Nao foi possivel listar programas instalados"
+          
+          # Backup AppData Roaming
+          $appDataRoaming = "$env:APPDATA"
+          if (Test-Path $appDataRoaming) {
+              Write-Host "Backing up AppData Roaming..."
+              foreach ($app in $importantApps) {
+                  $appPath = Join-Path $appDataRoaming $app
+                  if (Test-Path $appPath) {
+                      Copy-Item -Path $appPath -Destination "$backupDir\ProgramData\AppData_Roaming\$app" -Recurse -Force -ErrorAction SilentlyContinue
+                  }
+              }
           }
-          $stateData = @{
-              LastRun = $timestamp
-              TailscaleIP = $env:TAILSCALE_IP
-              RunID = "${{ github.run_id }}"
+          
+          # Backup ProgramData comum
+          $commonProgramData = "C:\ProgramData"
+          $programDataApps = @("Microsoft", "Package Cache")
+          foreach ($app in $programDataApps) {
+              $appPath = Join-Path $commonProgramData $app
+              if (Test-Path $appPath) {
+                  Copy-Item -Path $appPath -Destination "$backupDir\ProgramData\CommonProgramData\$app" -Recurse -Force -ErrorAction SilentlyContinue
+              }
           }
-          $stateData | ConvertTo-Json | Out-File "$stateDir\last-run.json" -Force
-          Write-Host "Estado salvo com sucesso!"
+          
+          Write-Host "Program data backup completed!"
 
-      - name: Cache State for Next Run
+      - name: Backup Chocolatey Packages
         if: always()
-        uses: actions/cache/save@v4
+        run: |
+          Write-Host "Checking for Chocolatey..."
+          $backupDir = $env:BACKUP_DIR
+          
+          if (Test-Path "C:\ProgramData\chocolatey\bin\choco.exe") {
+              Write-Host "Chocolatey found! Exporting package list..."
+              & "C:\ProgramData\chocolatey\bin\choco.exe" list --local-only > "$backupDir\Programs\chocolatey_packages.txt"
+              
+              # Export with versions for easy reinstall
+              & "C:\ProgramData\chocolatey\bin\choco.exe" export "$backupDir\Programs\chocolatey_packages.config"
+          } else {
+              Write-Host "Chocolatey not installed, skipping..."
+          }
+
+      - name: Backup Scoop Packages
+        if: always()
+        run: |
+          Write-Host "Checking for Scoop..."
+          $backupDir = $env:BACKUP_DIR
+          
+          if (Test-Path "$env:USERPROFILE\scoop\shims\scoop.cmd") {
+              Write-Host "Scoop found! Exporting package list..."
+              & "$env:USERPROFILE\scoop\shims\scoop.cmd" export > "$backupDir\Programs\scoop_packages.json"
+              
+              # Backup Scoop apps directory
+              if (Test-Path "$env:USERPROFILE\scoop\apps") {
+                  Copy-Item -Path "$env:USERPROFILE\scoop\apps" -Destination "$backupDir\Programs\scoop_apps" -Recurse -Force -ErrorAction SilentlyContinue
+              }
+          } else {
+              Write-Host "Scoop not installed, skipping..."
+          }
+
+      - name: Create Reinstall Script
+        if: always()
+        run: |
+          Write-Host "Creating reinstall script..."
+          $backupDir = $env:BACKUP_DIR
+          
+          $reinstallScript = @"
+# Script de reinstalação automática de programas
+# Execute como Administrador
+
+Write-Host "=== Script de Reinstalação de Programas ===" -ForegroundColor Green
+
+# Instalar Chocolatey se necessário
+if (-not (Test-Path "C:\ProgramData\chocolatey\bin\choco.exe")) {
+    Write-Host "Instalando Chocolatey..." -ForegroundColor Yellow
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+}
+
+# Reinstalar pacotes Chocolatey
+if (Test-Path ".\Programs\chocolatey_packages.config") {
+    Write-Host "Reinstalando pacotes Chocolatey..." -ForegroundColor Yellow
+    choco install ".\Programs\chocolatey_packages.config" -y
+}
+
+# Instalar Scoop se necessário
+if (-not (Test-Path "$env:USERPROFILE\scoop\shims\scoop.cmd")) {
+    Write-Host "Instalando Scoop..." -ForegroundColor Yellow
+    Invoke-Expression (New-Object System.Net.WebClient).DownloadString('https://get.scoop.sh')
+}
+
+# Reinstalar pacotes Scoop
+if (Test-Path ".\Programs\scoop_packages.json") {
+    Write-Host "Reinstalando pacotes Scoop..." -ForegroundColor Yellow
+    Get-Content ".\Programs\scoop_packages.json" | ConvertFrom-Json | ForEach-Object {
+        scoop install $_.Name
+    }
+}
+
+Write-Host "`n=== Lista de Programas Instalados ===" -ForegroundColor Green
+Write-Host "Verifique os arquivos CSV na pasta Programs para ver todos os programas que estavam instalados."
+Write-Host "`nArquivos disponíveis:"
+Get-ChildItem ".\Programs\*.csv" | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+Write-Host "`n=== Concluído! ===" -ForegroundColor Green
+"@
+          
+          $reinstallScript | Out-File -FilePath "$backupDir\REINSTALL_PROGRAMS.ps1" -Encoding UTF8
+          Write-Host "Reinstall script created!"
+
+      - name: Backup User Data
+        if: always()
+        run: |
+          Write-Host "Starting user data backup..."
+          $backupDir = $env:BACKUP_DIR
+          
+          # Backup Desktop
+          if (Test-Path "C:\Users\RDP\Desktop") {
+              Copy-Item -Path "C:\Users\RDP\Desktop\*" -Destination "$backupDir\Desktop" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          
+          # Backup Documents
+          if (Test-Path "C:\Users\RDP\Documents") {
+              Copy-Item -Path "C:\Users\RDP\Documents\*" -Destination "$backupDir\Documents" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          
+          # Backup Downloads
+          if (Test-Path "C:\Users\RDP\Downloads") {
+              Copy-Item -Path "C:\Users\RDP\Downloads\*" -Destination "$backupDir\Downloads" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          
+          # Backup any custom directories in workspace
+          if (Test-Path "$env:GITHUB_WORKSPACE\data") {
+              Copy-Item -Path "$env:GITHUB_WORKSPACE\data\*" -Destination "$backupDir\workspace_data" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          
+          Write-Host "User data backup completed!"
+
+      - name: Generate Backup Report
+        if: always()
+        run: |
+          Write-Host "Generating backup report..."
+          $backupDir = $env:BACKUP_DIR
+          
+          $report = @"
+=== RELATÓRIO DE BACKUP ===
+Data: $(Get-Date -Format "dd/MM/yyyy HH:mm:ss")
+Run ID: $env:GITHUB_RUN_ID
+
+PROGRAMAS INSTALADOS:
+"@
+          
+          if (Test-Path "$backupDir\Programs\installed_programs_x64.csv") {
+              $count = (Import-Csv "$backupDir\Programs\installed_programs_x64.csv").Count
+              $report += "`n- Programas 64-bit: $count"
+          }
+          
+          if (Test-Path "$backupDir\Programs\installed_programs_x86.csv") {
+              $count = (Import-Csv "$backupDir\Programs\installed_programs_x86.csv").Count
+              $report += "`n- Programas 32-bit: $count"
+          }
+          
+          if (Test-Path "$backupDir\Programs\chocolatey_packages.txt") {
+              $report += "`n- Chocolatey: Sim"
+          }
+          
+          if (Test-Path "$backupDir\Programs\scoop_packages.json") {
+              $report += "`n- Scoop: Sim"
+          }
+          
+          $report += "`n`nDIRETÓRIOS BACKUP:"
+          Get-ChildItem $backupDir -Directory | ForEach-Object {
+              $size = (Get-ChildItem $_.FullName -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB
+              $report += "`n- $($_.Name): $([math]::Round($size, 2)) MB"
+          }
+          
+          $report | Out-File -FilePath "$backupDir\BACKUP_REPORT.txt" -Encoding UTF8
+          Write-Host $report
+          Write-Host "`nBackup report generated!"
+
+      - name: Compress Backup
+        if: always()
+        run: |
+          $backupDir = $env:BACKUP_DIR
+          $archivePath = "$env:GITHUB_WORKSPACE\backup-$(Get-Date -Format 'yyyyMMdd-HHmmss').zip"
+          
+          if (Test-Path $backupDir) {
+              Write-Host "Compressing backup... This may take a while..."
+              Compress-Archive -Path "$backupDir\*" -DestinationPath $archivePath -CompressionLevel Optimal -Force
+              
+              $archiveSize = (Get-Item $archivePath).Length / 1MB
+              Write-Host "Backup compressed to: $archivePath"
+              Write-Host "Archive size: $([math]::Round($archiveSize, 2)) MB"
+              
+              echo "BACKUP_ARCHIVE=$archivePath" >> $env:GITHUB_ENV
+          }
+
+      - name: Upload Backup as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          path: |
-            C:\ProgramData\RDP-State
-            C:\Users\runneradmin\AppData\Local\RDP-Apps
-          key: rdp-state-${{ github.run_id }}
+          name: rdp-backup-${{ github.run_id }}
+          path: ${{ env.BACKUP_ARCHIVE }}
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: |
+          Write-Host "Cleaning up..."
+          
+          # Disconnect Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" down
+          
+          # Remove RDP user
+          Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          
+          Write-Host "Cleanup completed!"
